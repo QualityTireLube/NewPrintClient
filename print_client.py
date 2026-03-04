@@ -156,7 +156,15 @@ def get_cups_printers():
     return printers, default
 
 
-def print_pdf(pdf_path, printer_name, copies=1):
+# Paper sizes mirroring the dashboard's PAPER_SIZES constant
+PAPER_SIZES = {
+    "Brother-QL800":   {"width": 62, "height": 29},
+    "Dymo-TwinTurbo":  {"width": 89, "height": 36},
+    "29mmx90mm":       {"width": 90, "height": 29},
+}
+
+
+def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
     """
     Send a PDF to a CUPS printer via `lp`.
     Returns (success: bool, message: str).
@@ -168,6 +176,20 @@ def print_pdf(pdf_path, printer_name, copies=1):
         cmd += ["-n", str(copies)]
     # Force PDF MIME type so CUPS doesn't fall back to text/plain
     cmd += ["-o", "document-format=application/pdf"]
+    # Fit the PDF to the label media
+    cmd += ["-o", "fit-to-page"]
+
+    # Determine orientation from paper size — if width > height, it's landscape
+    ps = PAPER_SIZES.get(paper_size or "")
+    if ps and ps["width"] > ps["height"]:
+        # orientation-requested=4 = landscape (90° CCW rotation)
+        cmd += ["-o", "orientation-requested=4"]
+        add_log(f"  Orientation: landscape (paper {paper_size}: {ps['width']}x{ps['height']}mm)")
+    else:
+        # Even if unknown, label stock is almost always landscape
+        cmd += ["-o", "orientation-requested=4"]
+        add_log(f"  Orientation: landscape (default for label stock)")
+
     cmd.append(pdf_path)
 
     add_log(f"  CUPS command: {' '.join(cmd)}")
@@ -274,8 +296,9 @@ def process_job(job):
             tmp_path = tmp.name
         add_log(f"  PDF decoded: {len(pdf_bytes)} bytes -> {tmp_path}")
 
-        # 4. Print
-        success, message = print_pdf(tmp_path, printer, copies)
+        # 4. Print (pass paper size for correct orientation)
+        paper_size = job.get("paperSize", "")
+        success, message = print_pdf(tmp_path, printer, copies, paper_size)
 
         if success:
             add_log(f"  Printed successfully: {message}", job_id=job_id, printer=printer)
