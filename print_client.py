@@ -34,6 +34,11 @@ except ImportError:
     print("ERROR: requests not installed. Run: pip3 install requests")
     sys.exit(1)
 
+try:
+    from pypdf import PdfReader as _PdfReader
+except ImportError:
+    _PdfReader = None
+
 # ─── Configuration ──────────────────────────────────────────────────
 
 SERVER_URL = os.environ.get(
@@ -176,13 +181,47 @@ PRINTER_DEFAULTS = {
     "HP_LaserJet_Pro_M118_M119":      None,
 }
 
+# Brother QL-800 PPD PageSize codes (from `lpoptions -p Brother_QL_800_2 -l`)
+# Key: (tape_width_mm, tape_length_mm) — always portrait (narrow x long)
+BROTHER_QL_PAGESIZE = {
+    (17, 54): "DC01",
+    (17, 87): "DC02",
+    (23, 23): "DC20",
+    (29, 42): "DC08",
+    (29, 90): "DC03",   # 1.1" x 3.5" standard address/tire label
+    (38, 90): "DC04",
+    (39, 48): "DC17",
+    (52, 29): "DC24",
+}
+
+
+def get_pdf_dimensions_mm(pdf_path):
+    """Return (width_mm, height_mm) from first page MediaBox, or (None, None)."""
+    if _PdfReader is not None:
+        try:
+            page = _PdfReader(pdf_path).pages[0]
+            return round(float(page.mediabox.width) / 72 * 25.4, 1), \
+                   round(float(page.mediabox.height) / 72 * 25.4, 1)
+        except Exception:
+            pass
+    # Fallback: regex scan for uncompressed PDFs
+    try:
+        raw = open(pdf_path, "rb").read()
+        m = re.search(rb"/MediaBox\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]", raw)
+        if m:
+            x0, y0, x1, y1 = (float(v) for v in m.groups())
+            return round((x1 - x0) / 72 * 25.4, 1), round((y1 - y0) / 72 * 25.4, 1)
+    except Exception:
+        pass
+    return None, None
+
 
 def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
     """
     Send a PDF to a CUPS printer via `lp`.
     Returns (success: bool, message: str).
     """
-    # If no paper size provided, look up printer default
+    # Fall back to printer default if no paper size provided
     if not paper_size and printer_name:
         paper_size = PRINTER_DEFAULTS.get(printer_name)
         if paper_size:
@@ -193,23 +232,46 @@ def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
         cmd += ["-d", printer_name]
     if copies and copies > 1:
         cmd += ["-n", str(copies)]
-    # Force PDF MIME type so CUPS doesn't fall back to text/plain
     cmd += ["-o", "document-format=application/pdf"]
-    # Fit the PDF to the label media
     cmd += ["-o", "fit-to-page"]
 
-    # Set media size if we have a known paper size
-    ps = PAPER_SIZES.get(paper_size or "")
-    if ps:
-        # Set CUPS media size in mm  (e.g. "Custom.90x29mm")
-        cmd += ["-o", f"media=Custom.{ps['width']}x{ps['height']}mm"]
-        add_log(f"  Media: {paper_size} ({ps['width']}x{ps['height']}mm)")
+    # Read actual PDF dimensions to decide media + orientation
+    pdf_w, pdf_h = get_pdf_dimensions_mm(pdf_path)
+    pdf_is_landscape = pdf_w is not None and pdf_w > pdf_h
 
-    # Do NOT set orientation-requested — the PDF is already generated with
-    # the correct landscape page dimensions by the dashboard (pdf-lib).
-    # The Brother QL driver ignores or double-rotates this flag, causing
-    # portrait output. Letting CUPS auto-detect avoids the problem.
-    add_log(f"  Orientation: auto (PDF has correct page dimensions)")
+    is_brother_ql = printer_name and "Brother_QL" in printer_name
+
+    if is_brother_ql and pdf_w is not None:
+        # Map PDF dims to the correct Brother PPD PageSize code.
+        # DC codes are defined portrait (narrow × long), so normalise to
+        # (min_dim, max_dim) regardless of PDF orientation.
+        key = (round(min(pdf_w, pdf_h)), round(max(pdf_w, pdf_h)))
+        dc_code = BROTHER_QL_PAGESIZE.get(key)
+
+        if dc_code:
+            cmd += ["-o", f"PageSize={dc_code}"]
+            add_log(f"  Media: {dc_code} ({key[0]}x{key[1]}mm)")
+        else:
+            # Unknown label size — use Custom portrait dimensions
+            portrait_w = round(min(pdf_w, pdf_h), 2)
+            portrait_h = round(max(pdf_w, pdf_h), 2)
+            cmd += ["-o", f"PageSize=Custom.{portrait_w}x{portrait_h}mm"]
+            add_log(f"  Media: Custom.{portrait_w}x{portrait_h}mm (unrecognised label size)")
+
+        if pdf_is_landscape:
+            # PDF is landscape; DC codes are portrait → rotate 90° CCW to fill media
+            cmd += ["-o", "orientation-requested=4"]
+            add_log(f"  Orientation: landscape→portrait rotation (PDF {pdf_w}x{pdf_h}mm)")
+        else:
+            add_log(f"  Orientation: none (PDF already portrait {pdf_w}x{pdf_h}mm)")
+
+    else:
+        # Non-Brother printer: use Custom media size from PAPER_SIZES
+        ps = PAPER_SIZES.get(paper_size or "")
+        if ps:
+            cmd += ["-o", f"media=Custom.{ps['width']}x{ps['height']}mm"]
+            add_log(f"  Media: {paper_size} ({ps['width']}x{ps['height']}mm)")
+        add_log(f"  Orientation: auto")
 
     cmd.append(pdf_path)
 
@@ -394,6 +456,8 @@ def poll_loop():
                         break
                     process_job(job)
                 consecutive_errors = 0
+                # Re-poll immediately — there may be more jobs queued
+                continue
             else:
                 consecutive_errors = 0
 
@@ -723,7 +787,8 @@ def test_connection():
 
 # ─── Startup ─────────────────────────────────────────────────────────
 
-def main():
+def setup():
+    """Start polling/heartbeat threads and register with server. Does NOT start Flask."""
     log.info("=" * 50)
     log.info("QL Print Client v2.0")
     log.info("=" * 50)
@@ -739,28 +804,24 @@ def main():
     else:
         log.warning("  No CUPS printers detected!")
 
-    # Auto-start polling
     global polling_active, poll_thread, heartbeat_thread
     polling_active = True
     poll_thread = threading.Thread(target=poll_loop, daemon=True)
     poll_thread.start()
 
-    # Auto-start heartbeat / log forwarding
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
 
-    # Register with server
     try:
         api_post("/api/print/clients/register", {
             "clientId": CLIENT_ID,
             "name": CLIENT_NAME,
-            "description": f"QL Print Client v2.0",
+            "description": "QL Print Client v2.0",
         })
         log.info("  Registered with server")
     except Exception as e:
         log.warning(f"  Registration failed: {e}")
 
-    # Register printers (batch)
     if printers:
         try:
             printer_list = [
@@ -785,7 +846,23 @@ def main():
     log.info(f"  Dashboard: http://localhost:{FLASK_PORT}")
     log.info("")
 
+
+def run_flask():
+    """Start the Flask server (blocking)."""
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=False)
+
+
+def main():
+    setup()
+
+    if "--no-browser" not in sys.argv:
+        import webbrowser
+        def _open_browser():
+            time.sleep(2)
+            webbrowser.open(f"http://localhost:{FLASK_PORT}")
+        threading.Thread(target=_open_browser, daemon=True).start()
+
+    run_flask()
 
 
 if __name__ == "__main__":
