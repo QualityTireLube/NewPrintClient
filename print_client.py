@@ -233,13 +233,21 @@ def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
     if copies and copies > 1:
         cmd += ["-n", str(copies)]
     cmd += ["-o", "document-format=application/pdf"]
-    cmd += ["-o", "fit-to-page"]
 
     # Read actual PDF dimensions to decide media + orientation
     pdf_w, pdf_h = get_pdf_dimensions_mm(pdf_path)
     pdf_is_landscape = pdf_w is not None and pdf_w > pdf_h
 
     is_brother_ql = printer_name and "Brother_QL" in printer_name
+
+    # fit-to-page causes a double-rotation on Brother QL printers:
+    # CUPS rotates the landscape PDF to fit portrait media, then
+    # orientation-requested=4 rotates it again → text prints sideways.
+    # Use scaling=100 for Brother QL so only our explicit orientation flag applies.
+    if is_brother_ql:
+        cmd += ["-o", "scaling=100"]
+    else:
+        cmd += ["-o", "fit-to-page"]
 
     if is_brother_ql and pdf_w is not None:
         # Map PDF dims to the correct Brother PPD PageSize code.
