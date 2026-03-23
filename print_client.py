@@ -82,6 +82,10 @@ HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
 # Threading event: set by the RTDB SSE listener to wake the poll loop instantly
 wake_event = threading.Event()
 rtdb_listener_active = False
+# Incremented each time a new SSE listener is started; old threads check this
+# against their own captured generation and exit when superseded, preventing
+# the zombie-double-connection race that causes duplicate wake-up fires.
+_sse_generation = 0
 
 # ─── HTTP Helpers ────────────────────────────────────────────────────
 
@@ -439,19 +443,28 @@ def start_rtdb_sse_listener():
 
     Uses only the `requests` library — no Firebase SDK, no credentials.
     Runs on a daemon thread. Automatically reconnects on failure.
+
+    Generation counter (_sse_generation) prevents zombie threads from a
+    previous polling session from creating a second live SSE connection
+    and causing double wake-up fires.
     """
-    global rtdb_listener_active
+    global rtdb_listener_active, _sse_generation
+    _sse_generation += 1
+    my_gen = _sse_generation
 
     sse_url = f"{FIREBASE_DB_URL}/{RTDB_SIGNAL_PATH}.json"
 
     def sse_thread():
         global rtdb_listener_active
         reconnect_delay = 2
-        # Track the last jobId we saw so we don't skip a real signal on reconnect.
-        # Using a mutable container so the inner scope can update it.
-        last_seen = {"jobId": None}
+        # Tracks the last jobId we triggered on so we don't fire twice for
+        # the same signal.  None on first-ever connect: the initial RTDB value
+        # is used purely to establish a baseline (no wake fired for it).
+        # Persists across reconnections so a job seen before a drop is NOT
+        # re-fired after reconnect, but a NEW job written during the drop IS.
+        last_seen_job_id = None
 
-        while polling_active:
+        while polling_active and _sse_generation == my_gen:
             try:
                 add_log("SSE: connecting to Firebase RTDB...")
                 resp = http_requests.get(
@@ -466,14 +479,13 @@ def start_rtdb_sse_listener():
                 current_event_type = None
 
                 for raw_line in resp.iter_lines():
-                    if not polling_active:
+                    if not polling_active or _sse_generation != my_gen:
                         break
                     if not raw_line:
                         continue
 
                     line = raw_line.decode("utf-8", errors="replace")
 
-                    # Track the event type so we can act on put/patch only
                     if line.startswith("event:"):
                         current_event_type = line[6:].strip()
                         continue
@@ -485,7 +497,7 @@ def start_rtdb_sse_listener():
                     if not payload or payload == "null":
                         continue
 
-                    # Only wake on put/patch events (ignore cancel, auth_revoked, etc.)
+                    # Only act on put/patch; ignore keep-alive, cancel, etc.
                     if current_event_type not in (None, "put", "patch"):
                         current_event_type = None
                         continue
@@ -502,12 +514,18 @@ def start_rtdb_sse_listener():
 
                         incoming_job_id = signal_data.get("jobId")
 
-                        # Skip if this is the same signal we already acted on
-                        # (e.g. the initial state event on reconnect)
-                        if incoming_job_id and incoming_job_id == last_seen["jobId"]:
+                        # Very first event ever: establish baseline silently.
+                        # This prevents a spurious wake on the initial connection
+                        # while still allowing a new job written during a
+                        # reconnect to be detected (last_seen persists).
+                        if last_seen_job_id is None:
+                            last_seen_job_id = incoming_job_id or ""
                             continue
 
-                        last_seen["jobId"] = incoming_job_id
+                        if incoming_job_id and incoming_job_id == last_seen_job_id:
+                            continue
+
+                        last_seen_job_id = incoming_job_id
                         add_log(">>> RTDB wake-up signal received — checking for jobs")
                         wake_event.set()
                     except json.JSONDecodeError:
@@ -515,18 +533,18 @@ def start_rtdb_sse_listener():
 
             except http_requests.exceptions.ConnectionError:
                 rtdb_listener_active = False
-                if polling_active:
+                if polling_active and _sse_generation == my_gen:
                     add_log(f"SSE: connection lost, reconnecting in {reconnect_delay}s...", "warn")
             except http_requests.exceptions.Timeout:
                 rtdb_listener_active = False
-                if polling_active:
+                if polling_active and _sse_generation == my_gen:
                     add_log(f"SSE: connect timeout, retrying in {reconnect_delay}s...", "warn")
             except Exception as e:
                 rtdb_listener_active = False
-                if polling_active:
+                if polling_active and _sse_generation == my_gen:
                     add_log(f"SSE: error ({e}), reconnecting in {reconnect_delay}s...", "warn")
 
-            if polling_active:
+            if polling_active and _sse_generation == my_gen:
                 time.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 30)
 
