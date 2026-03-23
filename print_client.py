@@ -683,11 +683,10 @@ def poll_loop():
                 job_stats["sse_wakes"] += 1
             else:
                 job_stats["fallback_wakes"] += 1
-                if rtdb_listener_active:
-                    add_log("⚠ Safety-net poll fired (SSE connected but no signal in "
-                            f"{FALLBACK_POLL_INTERVAL}s — possible missed signal)", "warn")
-                else:
-                    add_log(f"⚠ Fallback poll — SSE not connected, reconnecting...", "warn")
+                # Only warn when there is genuinely no delivery mechanism active.
+                # When the tunnel OR SSE is working this is a silent background check.
+                if not rtdb_listener_active and not cloudflare_tunnel_url:
+                    add_log("⚠ Fallback poll — no SSE or tunnel active, using polling only", "warn")
 
     add_log("Polling stopped")
 
