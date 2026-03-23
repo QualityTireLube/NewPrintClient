@@ -52,7 +52,7 @@ DEFAULT_PRINTER = os.environ.get("DEFAULT_PRINTER", "")
 CLIENT_ID = os.environ.get("CLIENT_ID", "ql-mac-client")
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "Quality Tire Mac")
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "7010"))
-FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "3"))
+FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "30"))
 
 FIREBASE_DB_URL = "https://qualityexpress-c19f2-default-rtdb.firebaseio.com"
 RTDB_SIGNAL_PATH = "printers/pendingSignal"
@@ -74,7 +74,8 @@ heartbeat_thread = None
 print_log = []       # Recent activity log entries
 print_errors = []    # Recent errors
 log_forward_buffer = []  # Logs queued for Firebase forwarding
-job_stats = {"completed": 0, "failed": 0, "total_polled": 0}
+job_stats = {"completed": 0, "failed": 0, "total_polled": 0,
+             "sse_wakes": 0, "fallback_wakes": 0}
 
 MAX_LOG_ENTRIES = 200
 HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
@@ -627,9 +628,18 @@ def poll_loop():
             time.sleep(30)
             consecutive_errors = 0
         elif polling_active:
-            # Block until RTDB signal wakes us OR fallback timeout expires
-            wake_event.wait(timeout=FALLBACK_POLL_INTERVAL)
+            # Block until RTDB SSE signal wakes us, OR safety-net timeout
+            woke_by_sse = wake_event.wait(timeout=FALLBACK_POLL_INTERVAL)
             wake_event.clear()
+            if woke_by_sse:
+                job_stats["sse_wakes"] += 1
+            else:
+                job_stats["fallback_wakes"] += 1
+                if rtdb_listener_active:
+                    add_log("⚠ Safety-net poll fired (SSE connected but no signal in "
+                            f"{FALLBACK_POLL_INTERVAL}s — possible missed signal)", "warn")
+                else:
+                    add_log(f"⚠ Fallback poll — SSE not connected, reconnecting...", "warn")
 
     add_log("Polling stopped")
 
@@ -650,6 +660,8 @@ def heartbeat_loop():
                 "printerCount": len(printers),
                 "stats": job_stats.copy(),
                 "rtdbConnected": rtdb_listener_active,
+                "sseWakes": job_stats["sse_wakes"],
+                "fallbackWakes": job_stats["fallback_wakes"],
             })
         except Exception:
             pass  # Heartbeat failures are silent
