@@ -1008,6 +1008,7 @@ def receive_job():
     if not job or not job.get("id"):
         return jsonify({"error": "Invalid job payload — 'id' required"}), 400
     threading.Thread(target=process_job, args=(job,), daemon=True).start()
+    wake_event.set()  # counts as an SSE wake, not a fallback timeout
     return jsonify({"message": "received", "jobId": job["id"]}), 202
 
 
